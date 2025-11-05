@@ -6,6 +6,9 @@ It allows engineers and inspectors to “pick-on-print” dimensions, manage ins
 ✨ Features
 📄 Blueprint Viewing
 
+<img width="1915" height="1059" alt="image" src="https://github.com/user-attachments/assets/ae21b2f7-83a7-4e94-b2dc-f1efc6e39f94" />
+
+
 Supports PDF and common image formats (.png, .jpg, .jpeg).
 
 Smooth panning and mouse-wheel zooming.
