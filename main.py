@@ -1013,53 +1013,49 @@ class MainWindow(QMainWindow):
             return None
 
     def _parse_nominal_unequal_tol(self, text: str) -> Optional[tuple[float, float, float]]:
-        """Parse unequal bilateral tolerance like '1.005+.005-.000' or '1.005-.000+.005'.
-        Returns (nominal, plus_tol, minus_tol) if matched, else None.
-        - Uses fullmatch to avoid partial matches
-        - Normalizes Unicode signs and strips 'Ø'
-        - Ignores trailing tokens like TYP, REF, units (in, mm)
-        - Allows optional whitespace between signs and numbers
+        """Return (nominal, plus_tol, minus_tol) from strings like:
+           1.005+.005-.000   or   1.005 - .000 + .005
+        Uses fullmatch, normalizes signs/Ø, and ignores trailing TYP/REF/units.
         """
         import re
         if not text:
             return None
+
         s = str(text).strip()
-        # Normalize symbols and stray tokens
+        # Normalize common symbols and strip diameter symbol
         s = (s.replace("Ø", "")
-               .replace("＋", "+").replace("－", "-").replace("−", "-")
-             )
-        # Drop annotations like TYP/REF and trailing units
-        s = re.sub(r"\b(TYP|REF)\b.*$", "", s, flags=re.I).strip()
-        s = re.sub(r"\b(?:in|mm)\b$", "", s, flags=re.I).strip()
+             .replace("＋", "+").replace("－", "-").replace("−", "-"))
 
-        num = r"(?P<nom>[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
-        tol = r"(?P<t>(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)"
-        plus  = rf"\+\s*{tol}"
-        minus = rf"-\s*{tol}"
+        # Remove trailing annotations/units like TYP/REF/in/mm after the spec
+        s = re.sub(r"\b(?:TYP|REF)\b.*$", "", s, flags=re.I).strip()
+        s = re.sub(r"\s*(?:in|mm)\s*$", "", s, flags=re.I).strip()
 
-        # Case 1: nominal + plus_tol - minus_tol
+        # float patterns
+        fp  = r"(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?"
+        num = rf"(?P<nom>[-+]?{fp})"
+
+        # Allow spaces between sign and digits: + .005 / - .000
+        plus  = rf"\+\s*(?P<plus>{fp})"
+        minus = rf"-\s*(?P<minus>{fp})"
+
+        # nom +a -b
         m = re.fullmatch(rf"{num}\s*{plus}\s*{minus}", s)
         if m:
-            try:
-                nom = float(m.group('nom'))
-                vals = [float(x) for x in re.findall(rf"{tol}", m.group(0))]
-                if len(vals) == 2:
-                    plus_tol, minus_tol = vals[0], vals[1]
-                    return (nom, plus_tol, minus_tol)
-            except Exception:
-                return None
+            return (
+                float(m.group("nom")),
+                float(m.group("plus")),
+                float(m.group("minus")),
+            )
 
-        # Case 2: nominal - minus_tol + plus_tol
+        # nom -a +b
         m = re.fullmatch(rf"{num}\s*{minus}\s*{plus}", s)
         if m:
-            try:
-                nom = float(m.group('nom'))
-                vals = [float(x) for x in re.findall(rf"{tol}", m.group(0))]
-                if len(vals) == 2:
-                    minus_tol, plus_tol = vals[0], vals[1]
-                    return (nom, plus_tol, minus_tol)
-            except Exception:
-                return None
+            return (
+                float(m.group("nom")),
+                float(m.group("plus")),
+                float(m.group("minus")),
+            )
+
         return None
 
     def _num_or_none(self, text: str) -> Optional[float]:
