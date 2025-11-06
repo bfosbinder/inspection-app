@@ -19,13 +19,13 @@ jobs:
       - name: Upgrade pip
         run: py -m pip install --upgrade pip
 
-      - name: Install deps
+      - name: Install runtime deps + PyInstaller (build tool)
         run: |
           if (Test-Path requirements.txt) {
             py -m pip install -r requirements.txt
-          } else {
-            py -m pip install pyinstaller pyqt6 pymupdf opencv-python-headless pytesseract
           }
+          # Always ensure the build tool is present
+          py -m pip install pyinstaller
 
       - name: Build with PyInstaller (ONEDIR)
         run: >
