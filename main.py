@@ -316,6 +316,39 @@ class BalloonItem(QGraphicsEllipseItem):
                 self._save_cb(self.hs_id, offset)
         return super().itemChange(change, value)
 
+# ---------- Pop-out Preview Window ----------
+class PreviewWindow(QMainWindow):
+    """A lightweight window hosting an ImageView for a second-monitor preview."""
+    def __init__(self, on_close=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Blueprint Preview")
+        self.view = ImageView(self)
+        self.setCentralWidget(self.view)
+        self._on_close_cb = on_close
+        # Restore geometry
+        try:
+            self._settings = QSettings("InspectionApp", "PreviewWindow")
+            geom = self._settings.value("geometry")
+            if geom:
+                # PyQt will accept the stored QByteArray directly
+                self.restoreGeometry(geom)
+        except Exception:
+            pass
+
+    def closeEvent(self, event):
+        # Save geometry and notify main window
+        try:
+            if hasattr(self, "_settings"):
+                self._settings.setValue("geometry", self.saveGeometry())
+        except Exception:
+            pass
+        try:
+            if callable(self._on_close_cb):
+                self._on_close_cb()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
 # ---------- Delegates ----------
 class MethodComboDelegate(QStyledItemDelegate):
     """Editable combo box that offers existing methods as suggestions."""
@@ -410,6 +443,7 @@ class MainWindow(QMainWindow):
         self.current_page: int = 0
         # Guard to suppress any auto-saves during load/open flows
         self._is_loading: bool = False
+        self.preview_win: Optional[PreviewWindow] = None
 
         # UI
         self.view = ImageView()
@@ -447,6 +481,16 @@ class MainWindow(QMainWindow):
         self.act_pick.setCheckable(True)
         tools.addAction(self.act_fit)
         tools.addAction(self.act_pick)
+        # Pop-out preview action
+        self.act_preview = QAction(QIcon.fromTheme("window-new"), "Pop out Preview", self)
+        self.act_preview.setToolTip("Open a detachable preview window for a second monitor")
+        self.act_preview.setCheckable(True)
+        try:
+            self.act_preview.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        except Exception:
+            pass
+        self.act_preview.setEnabled(False)
+        tools.addAction(self.act_preview)
         self.btn_balloons = QPushButton("Balloons")
         self.btn_balloons.setCheckable(True)
         self.btn_balloons.setChecked(True)
@@ -516,6 +560,7 @@ class MainWindow(QMainWindow):
         self.act_pick.toggled.connect(self._toggle_pick)
         self.btn_balloons.toggled.connect(self._toggle_balloons)
         self.btn_ocr.clicked.connect(self._ocr_selected_row)
+        self.act_preview.toggled.connect(self._toggle_preview_window)
         self._balloons_on = True
 
         # Table delete action (keyboard shortcut + context menu)
@@ -552,6 +597,12 @@ class MainWindow(QMainWindow):
         if hasattr(self, "view") and hasattr(self.view, "_balloons"):
             try:
                 self.view.set_balloons_movable(self.mode == "ballooning")
+            except Exception:
+                pass
+        # Preview window balloons remain non-movable
+        if getattr(self, "preview_win", None) is not None:
+            try:
+                self.preview_win.view.set_balloons_movable(False)
             except Exception:
                 pass
         # Apply table cell edit permissions
@@ -723,6 +774,11 @@ class MainWindow(QMainWindow):
                 self.view.set_context_key(self._balloon_context_key())
             if self._balloons_on:
                 self._refresh_balloons_for_page()
+            # Enable pop-out preview action when a blueprint is loaded
+            if hasattr(self, "act_preview"):
+                self.act_preview.setEnabled(True)
+            # Sync preview if it's already open
+            self._sync_preview_full()
         except Exception as e:
             QMessageBox.critical(self, "Blueprint error", str(e))
 
@@ -890,6 +946,8 @@ class MainWindow(QMainWindow):
         if self._balloons_on:
             self._refresh_balloons_for_page()
         self.status.showMessage(f"Page {page_index}")
+        # Keep preview in sync when page changes
+        self._sync_preview_full()
 
     def _refresh_balloons_for_page(self):
         page_hs = [hs for hs in self.hotspots if hs.page == self.current_page]
@@ -899,6 +957,19 @@ class MainWindow(QMainWindow):
             items.append((hs.id, rect, str(idx)))
         self.view.set_balloons(items)
         self._update_status_counts()
+        # Update balloons in preview window too
+        if self.preview_win and self.preview_win.isVisible():
+            if self._balloons_on:
+                try:
+                    self.preview_win.view.set_balloons(items)
+                    self.preview_win.view.set_balloons_movable(False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.preview_win.view.clear_balloons()
+                except Exception:
+                    pass
 
     def _balloon_context_key(self) -> str:
         # Globalize offsets: same positions across serials
@@ -912,6 +983,15 @@ class MainWindow(QMainWindow):
         else:
             self.view.clear_balloons()
             self.status.showMessage("Balloons off")
+        # Mirror visibility in preview
+        if self.preview_win and self.preview_win.isVisible():
+            if on:
+                self._refresh_balloons_for_page()  # will push to preview as well
+            else:
+                try:
+                    self.preview_win.view.clear_balloons()
+                except Exception:
+                    pass
 
     def _collect_methods(self) -> list[str]:
         methods: list[str] = []
@@ -1578,12 +1658,97 @@ class MainWindow(QMainWindow):
         # focus Result column for quick entry (column 3 after adding Inspection Method)
         self.table.scrollTo(self.table.model().index(row, 0))
         self.table.setCurrentCell(row, 3)
+        # Sync selection/centering with preview
+        if self.preview_win and self.preview_win.isVisible():
+            try:
+                # Do not reset the preview pixmap here (it clears balloons).
+                # Assume the preview page was synced in _show_page/_sync_preview_full.
+                self.preview_win.view.center_on_rect(rect, hs.zoom)
+                if self._balloons_on:
+                    self.preview_win.view.highlight_balloon(hs.id)
+            except Exception:
+                pass
+
+    # ---- Preview sync & toggle ----
+    def _toggle_preview_window(self, on: bool):
+        if on:
+            if not self.bp:
+                QMessageBox.information(self, "Preview", "Load a blueprint first to open the preview.")
+                try:
+                    self.act_preview.setChecked(False)
+                except Exception:
+                    pass
+                return
+            if self.preview_win is None:
+                self.preview_win = PreviewWindow(on_close=self._on_preview_closed, parent=None)
+                try:
+                    self.preview_win.view.set_context_key(self._balloon_context_key())
+                    self.preview_win.view.set_balloons_movable(False)
+                except Exception:
+                    pass
+            self.preview_win.show()
+            self.preview_win.raise_()
+            self._sync_preview_full()
+        else:
+            if self.preview_win is not None:
+                try:
+                    self.preview_win.close()
+                except Exception:
+                    pass
+
+    def _on_preview_closed(self):
+        # Called when the pop-out window is closed (by user or programmatically)
+        try:
+            if hasattr(self, "act_preview") and self.act_preview.isChecked():
+                self.act_preview.setChecked(False)
+        except Exception:
+            pass
+        self.preview_win = None
+
+    def _sync_preview_full(self):
+        """Synchronize the preview window with the main view: page image, balloons, and selection."""
+        if not (self.preview_win and self.preview_win.isVisible() and self.bp):
+            return
+        try:
+            # Sync page image
+            pm = self.bp.render_page(self.current_page)
+            self.preview_win.view.set_pixmap(pm)
+            self.preview_win.view.set_context_key(self._balloon_context_key())
+            # Sync balloons
+            if self._balloons_on:
+                page_hs = [hs for hs in self.hotspots if hs.page == self.current_page]
+                items: list[tuple[str, QRectF, str]] = []
+                for idx, hs in enumerate(page_hs, start=1):
+                    rect = QRectF(hs.x, hs.y, max(2, hs.w), max(2, hs.h))
+                    items.append((hs.id, rect, str(idx)))
+                self.preview_win.view.set_balloons(items)
+                self.preview_win.view.set_balloons_movable(False)
+            else:
+                self.preview_win.view.clear_balloons()
+            # Sync selection highlighting and centering
+            indexes = self.table.selectionModel().selectedRows()
+            if indexes:
+                row = indexes[0].row()
+                if 0 <= row < len(self.hotspots):
+                    hs = self.hotspots[row]
+                    rect = QRectF(hs.x, hs.y, max(2, hs.w), max(2, hs.h))
+                    self.preview_win.view.center_on_rect(rect, hs.zoom)
+                    if self._balloons_on:
+                        self.preview_win.view.highlight_balloon(hs.id)
+        except Exception:
+            pass
 
     def closeEvent(self, event):
         # Persist splitter sizes so layout is restored on next launch
         try:
             if hasattr(self, "splitter"):
                 self.settings.setValue("splitterSizes", self.splitter.sizes())
+            # Ensure preview window geometry is saved as well
+            if self.preview_win is not None:
+                try:
+                    self.preview_win.close()
+                except Exception:
+                    pass
         except Exception:
             pass
         super().closeEvent(event)
