@@ -1,0 +1,6 @@
+[2025-11-07 11:45:04] Unhandled exception
+Traceback (most recent call last):
+  File "/home/brian/Documents/inspection-app/main.py", line 1885, in _edit_default_tolerances
+    dlg = QDialog(self)
+          ^^^^^^^
+NameError: name 'QDialog' is not defined

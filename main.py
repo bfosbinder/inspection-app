@@ -5,15 +5,18 @@ from typing import List, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     import numpy as np
 
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QSettings, QSize
-import sys, time, errno, traceback
-from PyQt6.QtGui import QAction, QPixmap, QImage, QPainter, QCursor, QFont, QPen, QBrush, QColor, QKeySequence, QIcon
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QSettings, QSize, QMarginsF, QUrl
+import sys, time, errno, traceback, re
+from PyQt6.QtGui import QAction, QPixmap, QImage, QPainter, QCursor, QFont, QPen, QBrush, QColor, QKeySequence, QIcon, QShortcut, QTextDocument, QTextOption, QPageSize, QPageLayout, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QVBoxLayout, QFileDialog, QMessageBox, QLabel, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QHBoxLayout, QPushButton, QInputDialog,
-    QStatusBar, QGraphicsEllipseItem, QGraphicsSimpleTextItem, QStyledItemDelegate, QComboBox, QLineEdit, QDockWidget
+    QStatusBar, QGraphicsEllipseItem, QGraphicsSimpleTextItem, QStyledItemDelegate, QComboBox, QLineEdit, QDockWidget,
+    QDialog, QFormLayout, QDoubleSpinBox, QDialogButtonBox, QSpinBox
 )
+from PyQt6.QtPrintSupport import QPrinter
+import html
 
 # ---- Matplotlib (optional) ----
 try:
@@ -158,6 +161,32 @@ class ImageView(QGraphicsView):
     def set_context_key(self, key: str):
         self._context_key = key or ""
 
+    def set_balloon_size(self, size: float, update_existing: bool = True):
+        """Set default balloon diameter in scene coordinates and optionally update existing balloons."""
+        try:
+            size = float(size)
+        except Exception:
+            size = self._balloon_size
+        self._balloon_size = max(12.0, min(200.0, size))
+        if not update_existing:
+            return
+        # Update existing ellipse geometry and re-center label text
+        for ellipse in self._balloons.values():
+            try:
+                ellipse.setRect(0, 0, self._balloon_size, self._balloon_size)
+                # Adjust any child text label
+                for child in getattr(ellipse, 'childItems', lambda: [])():
+                    if isinstance(child, QGraphicsSimpleTextItem):
+                        f = child.font()
+                        # Scale font roughly with diameter; keep within reasonable bounds
+                        pt = max(8.0, min(22.0, self._balloon_size * 0.33))
+                        f.setPointSizeF(pt)
+                        child.setFont(f)
+                        tr = child.boundingRect()
+                        child.setPos((self._balloon_size - tr.width()) / 2, (self._balloon_size - tr.height()) / 2 - 1)
+            except Exception:
+                pass
+
     def set_pixmap(self, pm: QPixmap):
         self.scene().clear()
         # Reset references to any cleared items to avoid double-removal warnings
@@ -169,6 +198,8 @@ class ImageView(QGraphicsView):
         self.scene().setSceneRect(self._pix_item.boundingRect())
         self.resetTransform()
         self.fitInView(self._pix_item, Qt.AspectRatioMode.KeepAspectRatio)
+        # Preserve current pick mode drag behavior after pixmap resets (page changes reload pixmap)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag if self._picking else QGraphicsView.DragMode.ScrollHandDrag)
 
     def set_pick_mode(self, on: bool):
         self._picking = on
@@ -306,6 +337,7 @@ class ImageView(QGraphicsView):
             dx, dy = self._load_offset(hs_id)
             pos = base_pos + QPointF(dx, dy)
             ellipse = BalloonItem(hs_id, base_pos, self._save_offset)
+            ellipse.setRect(0, 0, size, size)
             ellipse.setPen(QPen(Qt.GlobalColor.red, 3))
             ellipse.setBrush(QBrush(Qt.GlobalColor.white))
             ellipse.setZValue(10)
@@ -313,7 +345,12 @@ class ImageView(QGraphicsView):
             ellipse.setToolTip(hs_id)
             # text centered inside ellipse
             text = QGraphicsSimpleTextItem(label, ellipse)
-            f = QFont(); f.setBold(True); f.setPointSizeF(11)
+            f = QFont(); f.setBold(True)
+            # Scale font with balloon size; base 34px -> ~11pt
+            try:
+                f.setPointSizeF(max(8.0, min(22.0, size * 0.33)))
+            except Exception:
+                f.setPointSizeF(11)
             text.setFont(f)
             tr = text.boundingRect()
             text.setPos((size - tr.width()) / 2, (size - tr.height()) / 2 - 1)
@@ -357,6 +394,11 @@ class ImageView(QGraphicsView):
         for item in self._balloons.values():
             if isinstance(item, BalloonItem):
                 item.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsMovable, bool(enabled))
+                try:
+                    # Reflect cursor to avoid hand cursor in pick mode
+                    item.setCursor(QCursor(Qt.CursorShape.OpenHandCursor) if enabled else QCursor(Qt.CursorShape.CrossCursor))
+                except Exception:
+                    pass
 
 class BalloonItem(QGraphicsEllipseItem):
     def __init__(self, hs_id: str, base_pos: QPointF, save_cb, *args, **kwargs):
@@ -460,6 +502,48 @@ class HistoryProvider:
                 continue
         return vals
 
+    def _work_order_from_path(self, results_path: str) -> str:
+        """Extract the work order token from a results CSV path built like
+        '<blueprint>.<workorder>.results.csv'. Falls back gracefully to basename parsing.
+        """
+        try:
+            bp = self._get_bp() or ""
+            if bp and results_path.startswith(bp + ".") and results_path.endswith(".results.csv"):
+                return results_path[len(bp) + 1 : -len(".results.csv")]
+            # Fallback using basenames
+            import os as _os
+            base_bp = _os.path.basename(bp)
+            base_fp = _os.path.basename(results_path)
+            prefix = base_bp + "."
+            suffix = ".results.csv"
+            if base_fp.startswith(prefix) and base_fp.endswith(suffix):
+                return base_fp[len(prefix) : -len(suffix)]
+        except Exception:
+            pass
+        return ""
+
+    def load_series(self, hotspot_id: str, parse_func) -> list[tuple[float, str]]:
+        """Return list of (value, work_order) pairs for this hotspot across all result files."""
+        out: list[tuple[float, str]] = []
+        if not hotspot_id:
+            return out
+        for fp in self._result_files():
+            wo = self._work_order_from_path(fp)
+            try:
+                with open(fp, newline="", encoding="utf-8-sig") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        rid = str(row.get("id", "")).strip()
+                        if rid != hotspot_id:
+                            continue
+                        res = str(row.get("result", "")).strip()
+                        v = parse_func(res)
+                        if v is not None:
+                            out.append((v, wo))
+            except Exception:
+                continue
+        return out
+
 class HistoryDock(QDockWidget):
     def __init__(self, parent=None):
         super().__init__("History / SPC", parent)
@@ -467,6 +551,13 @@ class HistoryDock(QDockWidget):
         self._mw: MainWindow | None = None
         self.provider: HistoryProvider | None = None
         self._current_hotspot: Optional[Hotspot] = None
+        self._hover_bind_id: Optional[int] = None
+        self._hover_ctx = {
+            'artist': None,
+            'annot': None,
+            'ax': None,
+            'series': [],  # list of (x, y, work_order)
+        }
 
         self.main_widget = QWidget()
         self.vbox = QVBoxLayout(self.main_widget)
@@ -481,6 +572,11 @@ class HistoryDock(QDockWidget):
             self.fig = Figure(figsize=(5, 4), constrained_layout=True)
             self.canvas = FigureCanvas(self.fig)
             self.vbox.addWidget(self.canvas, 1)
+            # Connect hover handler
+            try:
+                self._hover_bind_id = self.canvas.mpl_connect('motion_notify_event', self._on_motion)
+            except Exception:
+                self._hover_bind_id = None
         else:
             self.fig = None
             self.canvas = None
@@ -500,19 +596,21 @@ class HistoryDock(QDockWidget):
         if self.provider is None:
             return
         parse = mw._parse_value if hasattr(mw, '_parse_value') else (lambda s: None)
-        values = self.provider.load_values(hs.id, parse)
+        series = self.provider.load_series(hs.id, parse)
+        values = [v for (v, _wo) in series]
         self.lbl_title.setText(f"Hotspot <b>{hs.id}</b> — {len(values)} historical reading(s)")
-        self._render_spc(values, hs)
+        self._render_spc(series, hs)
 
     # ---- SPC rendering ----
-    def _render_spc(self, values: list[float], hs: Hotspot):
+    def _render_spc(self, series: list[tuple[float, str]], hs: Hotspot):
         if not _HAVE_MPL or self.fig is None:
             # only update stats label
-            self.stats_label.setText(self._stats_text(values, hs))
+            self.stats_label.setText(self._stats_text([v for (v, _wo) in series], hs))
             return
         ax_ind = self.fig.get_axes()[0] if self.fig.get_axes() else self.fig.add_subplot(211)
         ax_mr = self.fig.get_axes()[1] if len(self.fig.get_axes()) > 1 else self.fig.add_subplot(212)
         ax_ind.clear(); ax_mr.clear()
+        values = [v for (v, _wo) in series]
         if not values:
             ax_ind.text(0.5, 0.5, "No numeric results yet", ha='center', va='center')
             ax_mr.text(0.5, 0.5, "", ha='center', va='center')
@@ -528,7 +626,23 @@ class HistoryDock(QDockWidget):
         ucl_x = mean_x + 3 * sigma
         lcl_x = mean_x - 3 * sigma
         # Individuals chart
-        ax_ind.plot(range(1, n+1), values, marker='o')
+        x = list(range(1, n+1))
+        ax_ind.plot(x, values, marker='o')
+        # Transparent scatter overlay for hover hit-testing
+        sc = ax_ind.scatter(x, values, s=40, alpha=0.0)
+        # Store hover context
+        self._hover_ctx['artist'] = sc
+        self._hover_ctx['ax'] = ax_ind
+        self._hover_ctx['series'] = [(xi, yi, series[i][1]) for i, (xi, yi) in enumerate(zip(x, values))]
+        # Create/update annotation
+        try:
+            if self._hover_ctx.get('annot') is None:
+                annot = ax_ind.annotate("", xy=(0,0), xytext=(12,12), textcoords="offset points",
+                                        bbox=dict(boxstyle="round", fc="w", ec="#333", alpha=0.9))
+                annot.set_visible(False)
+                self._hover_ctx['annot'] = annot
+        except Exception:
+            pass
         ax_ind.axhline(mean_x, color='green', linestyle='--', label='Mean')
         if sigma > 0:
             ax_ind.axhline(ucl_x, color='red', linestyle=':')
@@ -578,6 +692,42 @@ class HistoryDock(QDockWidget):
         if cpk is not None:
             parts.append(f"Cpk={cpk:.2f}")
         return " · ".join(parts)
+
+    # ---- hover handler ----
+    def _on_motion(self, event):
+        try:
+            ctx = self._hover_ctx
+            artist = ctx.get('artist')
+            annot = ctx.get('annot')
+            ax = ctx.get('ax')
+            series = ctx.get('series') or []
+            if artist is None or annot is None or ax is None:
+                return
+            if event.inaxes != ax:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    self.canvas.draw_idle()
+                return
+            contains, info = artist.contains(event)
+            if not contains:
+                if annot.get_visible():
+                    annot.set_visible(False)
+                    self.canvas.draw_idle()
+                return
+            ind = info.get('ind')
+            if not ind:
+                return
+            i = ind[0]
+            if i < 0 or i >= len(series):
+                return
+            xi, yi, wo = series[i]
+            annot.xy = (xi, yi)
+            label = f"WO: {wo if wo else '(unknown)'}\nValue: {yi:g}\nObs: {xi}"
+            annot.set_text(label)
+            annot.set_visible(True)
+            self.canvas.draw_idle()
+        except Exception:
+            pass
 
 # ---------- Delegates ----------
 class MethodComboDelegate(QStyledItemDelegate):
@@ -751,6 +901,35 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.lbl_status_filter)
         btns.addWidget(self.filter_status)
         btns.addStretch(1)
+        # Top-right logo (optional): looks for axis_logo.(png|jpg) in app folder or assets/
+        try:
+            self.logo_label = QLabel()
+            self.logo_label.setObjectName("AppLogoLabel")
+            self.logo_label.setStyleSheet("#AppLogoLabel { padding-right: 6px; }")
+            app_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                os.path.join(app_dir, "axis_logo.png"),
+                os.path.join(app_dir, "axis_logo.jpg"),
+                os.path.join(app_dir, "assets", "axis_logo.png"),
+                os.path.join(app_dir, "assets", "axis_logo.jpg"),
+            ]
+            pm = QPixmap()
+            for fp in candidates:
+                if os.path.exists(fp):
+                    pm = QPixmap(fp)
+                    if not pm.isNull():
+                        break
+            if not pm.isNull():
+                pm = pm.scaledToHeight(24, Qt.TransformationMode.SmoothTransformation)
+                self.logo_label.setPixmap(pm)
+            else:
+                # Fallback text logo
+                self.logo_label.setText("Axis")
+                f = QFont(); f.setBold(True); f.setPointSizeF(12)
+                self.logo_label.setFont(f)
+            btns.addWidget(self.logo_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        except Exception:
+            pass
         # Cap the button bar height to keep left panel compact
         try:
             btns_widget.setMaximumHeight(40)
@@ -777,13 +956,32 @@ class MainWindow(QMainWindow):
                 sp.setSizes([int(s) for s in sizes])
         except Exception:
             pass
+        # Apply persisted balloon size if present
+        try:
+            bs = self.settings.value("Balloon/size", 34.0)
+            bs = float(bs) if bs is not None else 34.0
+            if hasattr(self.view, 'set_balloon_size'):
+                self.view.set_balloon_size(bs, update_existing=False)
+        except Exception:
+            pass
 
         # menu
         file_menu = self.menuBar().addMenu("&File")
         act_open_bp = QAction("Open Blueprint…", self); act_open_bp.triggered.connect(self._choose_blueprint)
         act_open_csv = QAction("Open Hotspots/Results…", self); act_open_csv.triggered.connect(self._choose_hotspots)
         act_export = QAction("Export CSV…", self); act_export.triggered.connect(self._export_csv)
-        file_menu.addAction(act_open_bp); file_menu.addAction(act_open_csv); file_menu.addAction(act_export)
+        act_export_pdf = QAction("Export Table to PDF…", self); act_export_pdf.triggered.connect(self._export_pdf)
+        file_menu.addAction(act_open_bp); file_menu.addAction(act_open_csv); file_menu.addAction(act_export); file_menu.addAction(act_export_pdf)
+
+        # Settings menu for default tolerances
+        settings_menu = self.menuBar().addMenu("&Settings")
+        act_def_tols = QAction("Default Tolerances…", self)
+        act_def_tols.triggered.connect(self._edit_default_tolerances)
+        settings_menu.addAction(act_def_tols)
+        # Balloon size settings
+        act_balloon_size = QAction("Balloon Size…", self)
+        act_balloon_size.triggered.connect(self._edit_balloon_settings)
+        settings_menu.addAction(act_balloon_size)
 
         # signals
         self.table.selectionModel().selectionChanged.connect(self._row_selected)
@@ -808,6 +1006,20 @@ class MainWindow(QMainWindow):
         # Create history dock (initially hidden; user can toggle from View menu)
         self._setup_history_dock_action()
         self._maybe_create_history_dock()
+
+        # ---- keyboard shortcuts for Pick (P) and Drag (D) ----
+        try:
+            self.shortcut_pick = QShortcut(QKeySequence("P"), self)
+            self.shortcut_pick.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            self.shortcut_pick.activated.connect(lambda: self.act_pick.setChecked(True))
+        except Exception:
+            pass
+        try:
+            self.shortcut_drag = QShortcut(QKeySequence("D"), self)
+            self.shortcut_drag.setContext(Qt.ShortcutContext.ApplicationShortcut)
+            self.shortcut_drag.activated.connect(lambda: self.act_pick.setChecked(False))
+        except Exception:
+            pass
 
     # ---- robust file I/O helpers ----
     def _safe_atomic_csv_write(self, path: str, headers: list[str], rows_iterable, attempts: int = 6, sleep_s: float = 0.15):
@@ -889,16 +1101,18 @@ class MainWindow(QMainWindow):
                 self.btn_ocr.setVisible(self.mode != "inspection")
             except Exception:
                 pass
-        # Toggle balloon drag capability
+        # Toggle balloon drag capability (respect Pick mode)
         if hasattr(self, "view") and hasattr(self.view, "_balloons"):
             try:
-                self.view.set_balloons_movable(self.mode == "ballooning")
+                pick_on = bool(self.act_pick.isChecked()) if hasattr(self, "act_pick") else False
+                self.view.set_balloons_movable(self.mode == "ballooning" and not pick_on)
             except Exception:
                 pass
-        # Preview window balloons remain non-movable
+        # Preview window balloons follow same rule (but preview may be closed)
         if getattr(self, "preview_win", None) is not None:
             try:
-                self.preview_win.view.set_balloons_movable(False)
+                pick_on = bool(self.act_pick.isChecked()) if hasattr(self, "act_pick") else False
+                self.preview_win.view.set_balloons_movable(self.mode == "ballooning" and not pick_on)
             except Exception:
                 pass
         # Apply table cell edit permissions
@@ -1265,7 +1479,8 @@ class MainWindow(QMainWindow):
             if self._balloons_on:
                 try:
                     self.preview_win.view.set_balloons(items)
-                    self.preview_win.view.set_balloons_movable(False)
+                    pick_on = bool(self.act_pick.isChecked()) if hasattr(self, 'act_pick') else False
+                    self.preview_win.view.set_balloons_movable(self.mode == "ballooning" and not pick_on)
                 except Exception:
                     pass
             else:
@@ -1363,6 +1578,44 @@ class MainWindow(QMainWindow):
         self._apply_filters()
 
     # ---- numeric helpers & row paint ----
+    def _count_decimals(self, s: str) -> int:
+        if s is None:
+            return 0
+        t = str(s).strip()
+        # Normalize unicode minus
+        t = t.replace("−", "-")
+        # Extract the first number-like token
+        m = re.search(r"[-+]?((?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][-+]?\d+)?", t)
+        if not m:
+            return 0
+        token = m.group(1)
+        if "." not in token:
+            return 0
+        # Count digits to the right of the decimal point, preserving trailing zeros
+        # Examples: '1.' -> 0, '1.0' -> 1, '1.000' -> 3
+        decs = token.split(".", 1)[1]
+        return len(decs)
+
+    def _get_default_tol(self, decimals: int) -> Optional[float]:
+        # clamp >=3 -> 3; allow 0 via dec0 setting
+        d = decimals
+        if d >= 3:
+            d = 3
+        # Use QSettings (MainWindow self.settings already exists)
+        try:
+            settings = getattr(self, 'settings', None) or QSettings("InspectionApp", "MainWindow")
+            key_map = {0: "Tolerance/dec0", 1: "Tolerance/dec1", 2: "Tolerance/dec2", 3: "Tolerance/dec3"}
+            if d not in key_map:
+                return None
+            key = key_map[d]
+            val = settings.value(key, None)
+            if val is None or str(val).strip() == "":
+                defaults = {0: 0.0, 1: 0.03, 2: 0.01, 3: 0.005}
+                return float(defaults.get(d, 0.0))
+            return float(val)
+        except Exception:
+            defaults = {0: 0.0, 1: 0.03, 2: 0.01, 3: 0.005}
+            return float(defaults.get(d, 0.0))
     def _parse_value(self, text: str) -> Optional[float]:
         import re
         if text is None:
@@ -1551,6 +1804,33 @@ class MainWindow(QMainWindow):
                             self.table.item(row, 3).setText("")
                         finally:
                             self._updating_table = False
+                else:
+                    # New branch: bare number auto-fill default tolerance (Ballooning mode only)
+                    if self.mode == "ballooning" and hs.lsl is None and hs.usl is None and text != "":
+                        # Ensure it is a bare number: parse value and ensure original text matches a simple number pattern
+                        val = self._parse_value(text)
+                        if val is not None:
+                            # Reject if original had tolerance syntax (already handled above) or non-numeric noise
+                            # Simple pattern: optional sign digits . digits optional; no ± or + tol parts
+                            if re.fullmatch(r"[-+]?\d+(?:\.\d*)?|[-+]?\.\d+", text):
+                                decs = self._count_decimals(text)
+                                tol = self._get_default_tol(decs)
+                                if tol is not None:
+                                    if hs.nominal is None:
+                                        hs.nominal = val
+                                    if hs.lsl is None:
+                                        hs.lsl = hs.nominal - tol
+                                    if hs.usl is None:
+                                        hs.usl = hs.nominal + tol
+                                    self._updating_table = True
+                                    try:
+                                        self.table.item(row, 4).setText(self._fmt_num(hs.nominal))
+                                        self.table.item(row, 5).setText(self._fmt_num(hs.lsl))
+                                        self.table.item(row, 6).setText(self._fmt_num(hs.usl))
+                                        hs.result = ""
+                                        self.table.item(row, 3).setText("")
+                                    finally:
+                                        self._updating_table = False
             if self.mode == "inspection":
                 self._save_results_csv()
             else:
@@ -1680,6 +1960,41 @@ class MainWindow(QMainWindow):
         avg_conf = (sum(confs) / len(confs)) if confs else 0.0
         return text, avg_conf
 
+    # ---- Settings: Default Tolerances ----
+    def _edit_default_tolerances(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Default Tolerances")
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        # Load current values or defaults
+        v0 = self._get_default_tol(0)
+        v1 = self._get_default_tol(1) or 0.03
+        v2 = self._get_default_tol(2) or 0.01
+        v3 = self._get_default_tol(3) or 0.005
+        sp0 = QDoubleSpinBox(); sp0.setDecimals(6); sp0.setRange(0.0, 1e6); sp0.setSingleStep(0.001); sp0.setValue(float(v0 or 0.0))
+        sp1 = QDoubleSpinBox(); sp1.setDecimals(6); sp1.setRange(0.0, 1e6); sp1.setSingleStep(0.001); sp1.setValue(float(v1))
+        sp2 = QDoubleSpinBox(); sp2.setDecimals(6); sp2.setRange(0.0, 1e6); sp2.setSingleStep(0.001); sp2.setValue(float(v2))
+        sp3 = QDoubleSpinBox(); sp3.setDecimals(6); sp3.setRange(0.0, 1e6); sp3.setSingleStep(0.001); sp3.setValue(float(v3))
+        form.addRow("± for 0 decimals (e.g., 1)", sp0)
+        form.addRow("± for 1 decimal (e.g., 1.0)", sp1)
+        form.addRow("± for 2 decimals (e.g., 1.00)", sp2)
+        form.addRow("± for 3 decimals (e.g., 1.000)", sp3)
+        layout.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            try:
+                settings = getattr(self, 'settings', None) or QSettings("InspectionApp", "MainWindow")
+                settings.setValue("Tolerance/dec0", sp0.value())
+                settings.setValue("Tolerance/dec1", sp1.value())
+                settings.setValue("Tolerance/dec2", sp2.value())
+                settings.setValue("Tolerance/dec3", sp3.value())
+                self.status.showMessage("Saved default tolerances")
+            except Exception:
+                pass
+
     def _extract_pdf_text_in_rect(self, hs: Hotspot) -> Optional[str]:
         if not (self.bp and self.bp.is_pdf and fitz is not None and getattr(self.bp, "_doc", None) is not None):
             return None
@@ -1747,6 +2062,40 @@ class MainWindow(QMainWindow):
         suffix = " (no OpenCV)" if cv2 is None else ""
         self.status.showMessage(f"OCR: '{shown}' (conf ≈ {int(round(conf))}){suffix}")
 
+    # ---- Settings: Balloon Size ----
+    def _edit_balloon_settings(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Balloon Size")
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        # Current size from view or default
+        try:
+            curr_size = float(getattr(self.view, '_balloon_size', 34.0))
+        except Exception:
+            curr_size = 34.0
+        sp = QSpinBox(); sp.setRange(12, 200); sp.setSingleStep(2); sp.setValue(int(round(curr_size)))
+        sp.setSuffix(" px")
+        form.addRow("Balloon diameter", sp)
+        layout.addLayout(form)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(btns)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            size = float(sp.value())
+            try:
+                # Apply to main view
+                if hasattr(self.view, 'set_balloon_size'):
+                    self.view.set_balloon_size(size, update_existing=True)
+                # Apply to preview if present
+                if getattr(self, 'preview_win', None) is not None and hasattr(self.preview_win.view, 'set_balloon_size'):
+                    self.preview_win.view.set_balloon_size(size, update_existing=True)
+                # Persist setting
+                self.settings.setValue("Balloon/size", size)
+                self.status.showMessage(f"Balloon size set to {int(round(size))} px")
+            except Exception:
+                pass
+
     def _delete_selected_rows(self):
         if not self.hotspots or self.table.rowCount() == 0:
             QMessageBox.information(self, "Delete", "No hotspots to delete.")
@@ -1800,6 +2149,26 @@ class MainWindow(QMainWindow):
                 pass
             return
         self.view.set_pick_mode(on)
+        # While picking, prevent balloon movement to avoid accidental drags
+        try:
+            self.view.set_balloons_movable(False if on else (self.mode == "ballooning"))
+        except Exception:
+            pass
+        # Preview balloons: movable only when not picking and in Ballooning mode
+        if getattr(self, "preview_win", None) is not None:
+            try:
+                self.preview_win.view.set_balloons_movable(False if on else (self.mode == "ballooning"))
+                # Mirror pick state into preview so picking works there too
+                self.preview_win.view.set_pick_mode(on)
+                # Wire preview picking to same handler (safe to connect multiple times guardedly)
+                try:
+                    # Avoid duplicate connections by disconnecting first if previously connected
+                    self.preview_win.view.rectPicked.disconnect(self._picked_rect)
+                except Exception:
+                    pass
+                self.preview_win.view.rectPicked.connect(self._picked_rect)
+            except Exception:
+                pass
         self.status.showMessage("Pick mode: click-drag a rectangle on the print" if on else "Pick mode off")
 
     def _picked_rect(self, rect: QRectF):
@@ -1939,6 +2308,102 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Export error", str(e))
 
+    def _export_pdf(self):
+        """Export full hotspots table (unfiltered) to a PDF with header metadata."""
+        # Default filename based on the current CSV (results preferred, else hotspots), with .pdf extension
+        csv_source = self.results_path_wo or self.hotspots_path_global or "hotspots.csv"
+        try:
+            base_pdf = os.path.splitext(csv_source)[0] + ".pdf"
+        except Exception:
+            base_pdf = "hotspots_table.pdf"
+        path, _ = QFileDialog.getSaveFileName(self, "Export Table to PDF", base_pdf, "PDF (*.pdf)")
+        if not path:
+            return
+        # Derive part number and work order from current file naming conventions.
+        # part_number from blueprint file name (stem without extension)
+        part_number = ""
+        if self.blueprint_path:
+            bp_base = os.path.basename(self.blueprint_path)
+            part_number = os.path.splitext(bp_base)[0]
+        # work_order from results CSV path if available; fall back to self.work_order
+        work_order = self.work_order or ""
+        if self.results_path_wo:
+            inferred = self._infer_work_order_from_csv(self.results_path_wo, self.blueprint_path if self.blueprint_path else None)
+            if inferred is not None:
+                work_order = inferred or work_order
+        try:
+            doc = QTextDocument()
+            doc.setDefaultFont(QFont("Sans", 9))
+            header_html = "<h2 style='margin:4px 0'>Inspection Hotspots</h2>"
+            meta = []
+            if part_number:
+                meta.append(f"<b>Part Number:</b> {html.escape(part_number)}")
+            if work_order:
+                meta.append(f"<b>Work Order:</b> {html.escape(work_order)}")
+            if self.blueprint_path:
+                meta.append(f"<b>Blueprint:</b> {html.escape(os.path.basename(self.blueprint_path))}")
+            meta_html = ("<p style='margin:2px 0'>" + " &nbsp; · &nbsp; ".join(meta) + "</p>") if meta else ""
+            ths = ["ID","Page","Inspection Method","Result","Nominal","LSL","USL","Status"]
+            table_rows = []
+            for hs in self.hotspots:
+                status = self._compute_status(hs)
+                row_cells = [
+                    html.escape(hs.id or ""),
+                    str(hs.page),
+                    html.escape(hs.method or ""),
+                    html.escape(hs.result or ""),
+                    html.escape(self._fmt_num(hs.nominal)),
+                    html.escape(self._fmt_num(hs.lsl)),
+                    html.escape(self._fmt_num(hs.usl)),
+                    html.escape(status)
+                ]
+                tds = "".join(f"<td style='padding:2px 6px;border:1px solid #aaa'>{c}</td>" for c in row_cells)
+                # Row shading based on status
+                if status == "PASS":
+                    row_style = "background-color:#aaffaa;"
+                elif status == "FAIL":
+                    row_style = "background-color:#ffaaaa;"
+                else:
+                    row_style = "background-color:#ffeb96;"
+                table_rows.append(f"<tr style='{row_style}'>" + tds + "</tr>")
+            table_html = (
+                "<table style='border-collapse:collapse;margin-top:6px'>"
+                + "<thead><tr>"
+                + "".join(f"<th style='background:#eee;padding:3px 6px;border:1px solid #aaa'>{html.escape(h)}</th>" for h in ths)
+                + "</tr></thead><tbody>"
+                + "".join(table_rows)
+                + "</tbody></table>"
+            )
+            full_html = f"<html><body>{header_html}{meta_html}{table_html}</body></html>"
+            doc.setHtml(full_html)
+            printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+            printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+            printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
+            printer.setOutputFileName(path)
+            layout = QPageLayout(printer.pageLayout())
+            layout.setMargins(QMarginsF(15, 15, 15, 15))
+            printer.setPageLayout(layout)
+            doc.print(printer)
+            self.status.showMessage(f"Exported PDF: {os.path.basename(path)}")
+            # Confirmation dialog: open file?
+            try:
+                resp = QMessageBox.question(
+                    self,
+                    "Export Successful",
+                    f"PDF was saved to:\n{path}\n\nWould you like to open it now?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if resp == QMessageBox.StandardButton.Yes:
+                    # Try to open with system default viewer
+                    opened = QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+                    if not opened:
+                        QMessageBox.information(self, "Open PDF", "Couldn't open the PDF with the default viewer.")
+            except Exception:
+                pass
+        except Exception as e:
+            QMessageBox.critical(self, "Export PDF", f"Failed: {e}")
+
     def _row_selected(self, selected=None, deselected=None):
         if not self.bp or not self.hotspots:
             return
@@ -2011,7 +2476,18 @@ class MainWindow(QMainWindow):
                 self.preview_win = PreviewWindow(on_close=self._on_preview_closed, parent=None)
                 try:
                     self.preview_win.view.set_context_key(self._balloon_context_key())
-                    self.preview_win.view.set_balloons_movable(False)
+                    # Mirror current pick mode state into preview so picking works there too
+                    pick_on = bool(self.act_pick.isChecked()) if hasattr(self, 'act_pick') else False
+                    self.preview_win.view.set_pick_mode(pick_on)
+                    # Set initial balloon movability in preview
+                    self.preview_win.view.set_balloons_movable(self.mode == "ballooning" and not pick_on)
+                    # Apply current balloon size to preview
+                    try:
+                        curr_size = float(getattr(self.view, '_balloon_size', 34.0))
+                        if hasattr(self.preview_win.view, 'set_balloon_size'):
+                            self.preview_win.view.set_balloon_size(curr_size, update_existing=False)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             # Show preview without stealing focus and keep it behind the main window
@@ -2050,6 +2526,11 @@ class MainWindow(QMainWindow):
             pm = self.bp.render_page(self.current_page)
             self.preview_win.view.set_pixmap(pm)
             self.preview_win.view.set_context_key(self._balloon_context_key())
+            # Keep pick mode mirrored (page changes could reset drag cursor) and balloon movability
+            if hasattr(self, 'act_pick'):
+                pick_on = bool(self.act_pick.isChecked())
+                self.preview_win.view.set_pick_mode(pick_on)
+                self.preview_win.view.set_balloons_movable(self.mode == "ballooning" and not pick_on)
             # Sync balloons
             if self._balloons_on:
                 page_hs = [hs for hs in self.hotspots if hs.page == self.current_page]
@@ -2058,7 +2539,8 @@ class MainWindow(QMainWindow):
                     rect = QRectF(hs.x, hs.y, max(2, hs.w), max(2, hs.h))
                     items.append((hs.id, rect, str(idx)))
                 self.preview_win.view.set_balloons(items)
-                self.preview_win.view.set_balloons_movable(False)
+                pick_on = bool(self.act_pick.isChecked()) if hasattr(self, 'act_pick') else False
+                self.preview_win.view.set_balloons_movable(self.mode == "ballooning" and not pick_on)
             else:
                 self.preview_win.view.clear_balloons()
             # Sync selection highlighting and centering
