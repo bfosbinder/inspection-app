@@ -6,6 +6,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QSettings, QSize
+import sys, time, errno, traceback
 from PyQt6.QtGui import QAction, QPixmap, QImage, QPainter, QCursor, QFont, QPen, QBrush, QColor, QKeySequence, QIcon
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
@@ -41,6 +42,30 @@ try:
     import fitz  # PyMuPDF
 except ImportError:
     fitz = None
+
+# ---- Optional global exception logging ----
+def _install_exception_hook(log_name: str = "InspectionApp-error.log"):
+    """Install a sys.excepthook that logs unhandled exceptions to a file
+    and shows a friendly dialog instead of crashing.
+    """
+    def _hook(exc_type, exc, tb):
+        try:
+            import datetime
+            ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # Prefer current working directory for the log by default
+            log_path = os.path.join(os.getcwd(), log_name)
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] Unhandled exception\n")
+                traceback.print_exception(exc_type, exc, tb, file=f)
+        except Exception:
+            pass
+        try:
+            QMessageBox.critical(None, "Unexpected error",
+                                 "An unexpected error occurred. Details were logged to\n"
+                                 f"{log_name}")
+        except Exception:
+            pass
+    sys.excepthook = _hook
 
 # ---------- Data ----------
 @dataclass
@@ -107,6 +132,8 @@ class ImageView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self._pix_item: Optional[QGraphicsPixmapItem] = None
         self._highlight: Optional[QGraphicsRectItem] = None
+        # persistent selection rectangle (stays as long as a row is selected)
+        self._selection: Optional[QGraphicsRectItem] = None
         # pick mode state
         self._picking: bool = False
         self._rubber: Optional[QGraphicsRectItem] = None
@@ -125,6 +152,7 @@ class ImageView(QGraphicsView):
         self.scene().clear()
         # Reset references to any cleared items to avoid double-removal warnings
         self._highlight = None
+        self._selection = None
         self._rubber = None
         self._balloons.clear()
         self._pix_item = self.scene().addPixmap(pm)
@@ -185,6 +213,14 @@ class ImageView(QGraphicsView):
         super().mouseReleaseEvent(e)
 
     def flash_rect(self, rect: QRectF, ms: int = 600):
+        # If a persistent selection exists, update it instead of creating a transient flash
+        if self._selection is not None and self._selection.scene() is not None:
+            try:
+                self._selection.setRect(rect)
+                self._selection.setVisible(True)
+            except Exception:
+                pass
+            return
         if self._highlight:
             self.scene().removeItem(self._highlight)
         self._highlight = QGraphicsRectItem(rect)
@@ -199,6 +235,32 @@ class ImageView(QGraphicsView):
         if self._highlight and self._highlight.scene() is not None:
             self.scene().removeItem(self._highlight)
         self._highlight = None
+
+    # ---- persistent selection API ----
+    def set_selection_rect(self, rect: QRectF):
+        # Create or update a persistent selection rectangle
+        try:
+            if self._selection is None or self._selection.scene() is None:
+                self._selection = QGraphicsRectItem(rect)
+                pen = QPen(Qt.GlobalColor.red, 2)
+                self._selection.setPen(pen)
+                # Transparent fill for selection; outline only
+                self._selection.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                self._selection.setZValue(25)
+                self.scene().addItem(self._selection)
+            else:
+                self._selection.setRect(rect)
+                self._selection.setVisible(True)
+        except Exception:
+            pass
+
+    def clear_selection_rect(self):
+        try:
+            if self._selection is not None and self._selection.scene() is not None:
+                self.scene().removeItem(self._selection)
+        except Exception:
+            pass
+        self._selection = None
 
     def center_on_rect(self, rect: QRectF, zoom_pct: float):
         self.centerOn(rect.center())
@@ -572,6 +634,66 @@ class MainWindow(QMainWindow):
 
         # start with blank preview and empty checklist
         self.status.showMessage("Ready. Open a blueprint and hotspots from the File menu to begin.")
+
+    # ---- robust file I/O helpers ----
+    def _safe_atomic_csv_write(self, path: str, headers: list[str], rows_iterable, attempts: int = 6, sleep_s: float = 0.15):
+        """Atomically write CSV to 'path' via a temp file in the same directory.
+        Retries os.replace on Windows if the file is locked. Cleans up .tmp files.
+        Raises on final failure so caller can show a user-facing error.
+        """
+        if not path:
+            raise ValueError("Target path is empty")
+        dir_path = os.path.dirname(os.path.abspath(path))
+        tmp_path = f"{path}.tmp"
+
+        if dir_path and not os.path.isdir(dir_path):
+            os.makedirs(dir_path, exist_ok=True)
+
+        # Write temp file in same folder
+        try:
+            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                if headers:
+                    w.writerow(headers)
+                for row in rows_iterable:
+                    w.writerow(row)
+        except Exception:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            raise
+
+        # Replace with retries for Windows locks
+        last_err: Optional[BaseException] = None
+        for _ in range(max(1, int(attempts))):
+            try:
+                os.replace(tmp_path, path)
+                last_err = None
+                break
+            except (PermissionError, OSError) as e:
+                err_no = getattr(e, "errno", None)
+                if isinstance(e, PermissionError) or err_no in (errno.EACCES, errno.EPERM):
+                    last_err = e
+                    time.sleep(max(0.0, float(sleep_s)))
+                    continue
+                else:
+                    last_err = e
+                    break
+            except Exception as e:
+                last_err = e
+                break
+
+        # Cleanup leftover temp file, if any
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+        if last_err is not None:
+            raise last_err
 
     # ---- mode handling ----
     def _set_mode(self, mode: str):
@@ -1535,14 +1657,12 @@ class MainWindow(QMainWindow):
         path = self.hotspots_path_global
         if not path:
             return
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["id","page","x","y","w","h","zoom","method","result","nominal","lsl","usl"])
+        headers = ["id","page","x","y","w","h","zoom","method","result","nominal","lsl","usl"]
+        def fmt(v):
+            return "" if v is None else (f"{v:g}")
+        def rows():
             for hs in self.hotspots:
-                def fmt(v):
-                    return "" if v is None else (f"{v:g}")
-                w.writerow([
+                yield [
                     hs.id, f"{hs.page}",
                     fmt(hs.x), fmt(hs.y),
                     fmt(hs.w), fmt(hs.h),
@@ -1551,8 +1671,12 @@ class MainWindow(QMainWindow):
                     fmt(hs.nominal),
                     fmt(hs.lsl),
                     fmt(hs.usl),
-                ])
-        os.replace(tmp, path)
+                ]
+        try:
+            self._safe_atomic_csv_write(path, headers, rows())
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Save error", f"Could not save hotspots CSV:\n{path}\n\n{e}")
 
     def _save_results_csv(self):
         """Write per-serial results overlay (id,result) only, merging with existing non-empty values to avoid accidental clears."""
@@ -1583,18 +1707,19 @@ class MainWindow(QMainWindow):
         for rid, res in existing.items():
             if rid not in merged:
                 merged[rid] = res
-        # Write merged
-        tmp = f"{path}.tmp"
-        with open(tmp, "w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(["id", "result"])
+        headers = ["id", "result"]
+        def rows():
             # Keep order: current hotspots first, then any extras from existing
             for rid in hs_ids:
-                w.writerow([rid, merged.get(rid, "")])
+                yield [rid, merged.get(rid, "")]
             for rid, res in merged.items():
                 if rid not in hs_ids:
-                    w.writerow([rid, res])
-        os.replace(tmp, path)
+                    yield [rid, res]
+        try:
+            self._safe_atomic_csv_write(path, headers, rows())
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.critical(self, "Save error", f"Could not save results CSV:\n{path}\n\n{e}")
 
     def _export_csv(self):
         """Export currently visible (filtered) rows to a user-selected CSV file."""
@@ -1638,6 +1763,14 @@ class MainWindow(QMainWindow):
             return
         indexes = self.table.selectionModel().selectedRows()
         if not indexes:
+            # No selection: clear selection rects in both views
+            try:
+                if hasattr(self.view, "clear_selection_rect"):
+                    self.view.clear_selection_rect()
+                if self.preview_win and self.preview_win.isVisible() and hasattr(self.preview_win.view, "clear_selection_rect"):
+                    self.preview_win.view.clear_selection_rect()
+            except Exception:
+                pass
             return
         row = indexes[0].row()
         if row < 0 or row >= len(self.hotspots):
@@ -1651,6 +1784,12 @@ class MainWindow(QMainWindow):
 
         rect = QRectF(hs.x, hs.y, max(2, hs.w), max(2, hs.h))
         self.view.center_on_rect(rect, hs.zoom)
+        # Persistent selection rectangle in main view
+        try:
+            if hasattr(self.view, "set_selection_rect"):
+                self.view.set_selection_rect(rect)
+        except Exception:
+            pass
 
         if self._balloons_on:
             self.view.highlight_balloon(hs.id)
@@ -1664,6 +1803,8 @@ class MainWindow(QMainWindow):
                 # Do not reset the preview pixmap here (it clears balloons).
                 # Assume the preview page was synced in _show_page/_sync_preview_full.
                 self.preview_win.view.center_on_rect(rect, hs.zoom)
+                if hasattr(self.preview_win.view, "set_selection_rect"):
+                    self.preview_win.view.set_selection_rect(rect)
                 if self._balloons_on:
                     self.preview_win.view.highlight_balloon(hs.id)
             except Exception:
@@ -1733,8 +1874,14 @@ class MainWindow(QMainWindow):
                     hs = self.hotspots[row]
                     rect = QRectF(hs.x, hs.y, max(2, hs.w), max(2, hs.h))
                     self.preview_win.view.center_on_rect(rect, hs.zoom)
+                    if hasattr(self.preview_win.view, "set_selection_rect"):
+                        self.preview_win.view.set_selection_rect(rect)
                     if self._balloons_on:
                         self.preview_win.view.highlight_balloon(hs.id)
+            else:
+                # No selection: clear selection rect in preview
+                if hasattr(self.preview_win.view, "clear_selection_rect"):
+                    self.preview_win.view.clear_selection_rect()
         except Exception:
             pass
 
@@ -1754,6 +1901,11 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 def main():
+    # Optionally install a global exception hook to log unexpected errors
+    try:
+        _install_exception_hook()
+    except Exception:
+        pass
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
