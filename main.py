@@ -1827,8 +1827,16 @@ class MainWindow(QMainWindow):
                     self.preview_win.view.set_balloons_movable(False)
                 except Exception:
                     pass
+            # Show preview without stealing focus and keep it behind the main window
+            try:
+                self.preview_win.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+            except Exception:
+                pass
             self.preview_win.show()
-            self.preview_win.raise_()
+            try:
+                self.preview_win.lower()
+            except Exception:
+                pass
             self._sync_preview_full()
         else:
             if self.preview_win is not None:
