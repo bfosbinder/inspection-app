@@ -1,4 +1,4 @@
-import sys, os, csv, shutil
+import sys, os, csv, shutil, glob
 from dataclasses import dataclass
 from typing import List, Optional, TYPE_CHECKING
 
@@ -12,8 +12,18 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter, QTableWidget, QTableWidgetItem, QToolBar,
     QVBoxLayout, QFileDialog, QMessageBox, QLabel, QGraphicsView, QGraphicsScene,
     QGraphicsPixmapItem, QGraphicsRectItem, QHBoxLayout, QPushButton, QInputDialog,
-    QStatusBar, QGraphicsEllipseItem, QGraphicsSimpleTextItem, QStyledItemDelegate, QComboBox, QLineEdit
+    QStatusBar, QGraphicsEllipseItem, QGraphicsSimpleTextItem, QStyledItemDelegate, QComboBox, QLineEdit, QDockWidget
 )
+
+# ---- Matplotlib (optional) ----
+try:
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+    from matplotlib.figure import Figure
+    _HAVE_MPL = True
+except Exception:
+    FigureCanvas = None
+    Figure = None
+    _HAVE_MPL = False
 
 # OCR / CV deps (optional until used)
 try:
@@ -411,6 +421,164 @@ class PreviewWindow(QMainWindow):
             pass
         super().closeEvent(event)
 
+# ---------- History / SPC Dock ----------
+class HistoryProvider:
+    """Aggregates historical numeric results for a hotspot across all per-serial results CSVs for the current blueprint."""
+    def __init__(self, blueprint_path_getter):
+        # blueprint_path_getter: callable returning current blueprint path
+        self._get_bp = blueprint_path_getter
+
+    def _result_files(self) -> list[str]:
+        bp = self._get_bp() or ""
+        if not bp:
+            return []
+        # Pattern: blueprint.ext.*.results.csv
+        pattern = f"{bp}.*.results.csv"
+        try:
+            files = sorted(glob.glob(pattern))
+        except Exception:
+            files = []
+        return files
+
+    def load_values(self, hotspot_id: str, parse_func) -> list[float]:
+        vals: list[float] = []
+        if not hotspot_id:
+            return vals
+        for fp in self._result_files():
+            try:
+                with open(fp, newline="", encoding="utf-8-sig") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        rid = str(row.get("id", "")).strip()
+                        if rid != hotspot_id:
+                            continue
+                        res = str(row.get("result", "")).strip()
+                        v = parse_func(res)
+                        if v is not None:
+                            vals.append(v)
+            except Exception:
+                continue
+        return vals
+
+class HistoryDock(QDockWidget):
+    def __init__(self, parent=None):
+        super().__init__("History / SPC", parent)
+        self.setObjectName("HistorySPCDock")  # for QSettings/restore
+        self._mw: MainWindow | None = None
+        self.provider: HistoryProvider | None = None
+        self._current_hotspot: Optional[Hotspot] = None
+
+        self.main_widget = QWidget()
+        self.vbox = QVBoxLayout(self.main_widget)
+        self.lbl_title = QLabel("Select a hotspot to view history")
+        self.lbl_title.setWordWrap(True)
+        self.vbox.addWidget(self.lbl_title)
+        self.stats_label = QLabel("")
+        self.stats_label.setWordWrap(True)
+        self.vbox.addWidget(self.stats_label)
+
+        if _HAVE_MPL:
+            self.fig = Figure(figsize=(5, 4), constrained_layout=True)
+            self.canvas = FigureCanvas(self.fig)
+            self.vbox.addWidget(self.canvas, 1)
+        else:
+            self.fig = None
+            self.canvas = None
+            warn = QLabel("matplotlib not installed.\nRun: pip install matplotlib\nThe XmR chart will appear after installation.")
+            warn.setStyleSheet("color: #b00; font-weight: bold;")
+            self.vbox.addWidget(warn)
+
+        self.setWidget(self.main_widget)
+        self.setAllowedAreas(Qt.DockWidgetArea.RightDockWidgetArea | Qt.DockWidgetArea.LeftDockWidgetArea)
+
+    def attach(self, main_window: 'MainWindow'):
+        self._mw = main_window
+        self.provider = HistoryProvider(lambda: main_window.blueprint_path)
+
+    def update_for_hotspot(self, hs: Hotspot, mw: 'MainWindow'):
+        self._current_hotspot = hs
+        if self.provider is None:
+            return
+        parse = mw._parse_value if hasattr(mw, '_parse_value') else (lambda s: None)
+        values = self.provider.load_values(hs.id, parse)
+        self.lbl_title.setText(f"Hotspot <b>{hs.id}</b> — {len(values)} historical reading(s)")
+        self._render_spc(values, hs)
+
+    # ---- SPC rendering ----
+    def _render_spc(self, values: list[float], hs: Hotspot):
+        if not _HAVE_MPL or self.fig is None:
+            # only update stats label
+            self.stats_label.setText(self._stats_text(values, hs))
+            return
+        ax_ind = self.fig.get_axes()[0] if self.fig.get_axes() else self.fig.add_subplot(211)
+        ax_mr = self.fig.get_axes()[1] if len(self.fig.get_axes()) > 1 else self.fig.add_subplot(212)
+        ax_ind.clear(); ax_mr.clear()
+        if not values:
+            ax_ind.text(0.5, 0.5, "No numeric results yet", ha='center', va='center')
+            ax_mr.text(0.5, 0.5, "", ha='center', va='center')
+            self.stats_label.setText("No numeric results available.")
+            self.canvas.draw(); return
+        import math
+        import statistics as stats
+        n = len(values)
+        mr = [abs(values[i] - values[i-1]) for i in range(1, n)] if n > 1 else []
+        mean_x = stats.fmean(values)
+        avg_mr = stats.fmean(mr) if mr else 0.0
+        sigma = (avg_mr / 1.128) if avg_mr > 0 else 0.0  # Wheeler constant for n=2
+        ucl_x = mean_x + 3 * sigma
+        lcl_x = mean_x - 3 * sigma
+        # Individuals chart
+        ax_ind.plot(range(1, n+1), values, marker='o')
+        ax_ind.axhline(mean_x, color='green', linestyle='--', label='Mean')
+        if sigma > 0:
+            ax_ind.axhline(ucl_x, color='red', linestyle=':')
+            ax_ind.axhline(lcl_x, color='red', linestyle=':')
+        if hs.lsl is not None:
+            ax_ind.axhline(hs.lsl, color='#b060ff', linestyle='-.', label='LSL')
+        if hs.usl is not None:
+            ax_ind.axhline(hs.usl, color='#b060ff', linestyle='-.', label='USL')
+        ax_ind.set_title("XmR Individuals")
+        ax_ind.set_xlabel("Observation")
+        ax_ind.set_ylabel("Value")
+        ax_ind.legend(loc='best', fontsize='small')
+        # Moving Range chart
+        if mr:
+            ax_mr.plot(range(2, n+1), mr, marker='s')
+            ax_mr.axhline(avg_mr, color='green', linestyle='--', label='Mean MR')
+            ucl_mr = avg_mr * 3.267  # Wheeler constant
+            ax_mr.axhline(ucl_mr, color='red', linestyle=':')
+            ax_mr.set_title("Moving Range")
+            ax_mr.set_xlabel("Observation")
+            ax_mr.set_ylabel("Range")
+            ax_mr.legend(loc='best', fontsize='small')
+        else:
+            ax_mr.text(0.5, 0.5, "Need >=2 values for MR", ha='center', va='center')
+            ax_mr.set_axis_off()
+        self.stats_label.setText(self._stats_text(values, hs, mean_x, sigma))
+        self.canvas.draw()
+
+    def _stats_text(self, values: list[float], hs: Hotspot, mean_x: Optional[float] = None, sigma: Optional[float] = None) -> str:
+        if not values:
+            return ""
+        import statistics as stats
+        n = len(values)
+        mean_x = mean_x if mean_x is not None else stats.fmean(values)
+        stdev = stats.pstdev(values) if n > 1 else 0.0
+        lsl, usl = hs.lsl, hs.usl
+        cp = cpk = None
+        if lsl is not None and usl is not None and sigma is not None and sigma > 0:
+            cp = (usl - lsl) / (6 * sigma)
+            cpu = (usl - mean_x) / (3 * sigma)
+            cpl = (mean_x - lsl) / (3 * sigma)
+            cpk = min(cpu, cpl)
+        parts = [f"n={n}", f"mean={mean_x:g}"]
+        parts.append(f"σ_ind≈{sigma:g}" if sigma is not None else f"stdev={stdev:g}")
+        if cp is not None:
+            parts.append(f"Cp={cp:.2f}")
+        if cpk is not None:
+            parts.append(f"Cpk={cpk:.2f}")
+        return " · ".join(parts)
+
 # ---------- Delegates ----------
 class MethodComboDelegate(QStyledItemDelegate):
     """Editable combo box that offers existing methods as suggestions."""
@@ -506,6 +674,7 @@ class MainWindow(QMainWindow):
         # Guard to suppress any auto-saves during load/open flows
         self._is_loading: bool = False
         self.preview_win: Optional[PreviewWindow] = None
+        self.history_dock: Optional[HistoryDock] = None
 
         # UI
         self.view = ImageView()
@@ -634,6 +803,11 @@ class MainWindow(QMainWindow):
 
         # start with blank preview and empty checklist
         self.status.showMessage("Ready. Open a blueprint and hotspots from the File menu to begin.")
+        # Revert any advanced styling the user asked to undo (keep readability only)
+        self._revert_table_styling()
+        # Create history dock (initially hidden; user can toggle from View menu)
+        self._setup_history_dock_action()
+        self._maybe_create_history_dock()
 
     # ---- robust file I/O helpers ----
     def _safe_atomic_csv_write(self, path: str, headers: list[str], rows_iterable, attempts: int = 6, sleep_s: float = 0.15):
@@ -785,14 +959,18 @@ class MainWindow(QMainWindow):
         hh.setStretchLastSection(True)
         # Alternating rows and padding + softer selection overlay
         self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet(
-            """
-            QTableWidget { gridline-color: #888; }
-            QTableWidget::item { padding: 6px; }
-            QTableView::item:selected { background: rgba(30,144,255,160); color: black; }
-            QHeaderView::section { padding: 6px; font-weight: bold; }
-            """
-        )
+        self.table.setStyleSheet("")
+
+    def _revert_table_styling(self):
+        """Undo previously applied modern styling, returning to a simpler native look."""
+        try:
+            self.table.setStyleSheet("")
+            self.table.setAlternatingRowColors(False)
+            # Reset header stretch last section off (we can still allow manual resize)
+            hh = self.table.horizontalHeader()
+            hh.setStretchLastSection(False)
+        except Exception:
+            pass
 
     def _update_window_title(self):
         parts: list[str] = []
@@ -1027,6 +1205,8 @@ class MainWindow(QMainWindow):
             self._update_window_title()
             if hasattr(self.view, "set_context_key"):
                 self.view.set_context_key(self._balloon_context_key())
+            # Update history dock now that blueprint context changed
+            self._refresh_history_dock()
         finally:
             self._is_loading = False
 
@@ -1056,6 +1236,7 @@ class MainWindow(QMainWindow):
             self._update_window_title()
             if hasattr(self.view, "set_context_key"):
                 self.view.set_context_key(self._balloon_context_key())
+            self._refresh_history_dock()
         finally:
             self._is_loading = False
 
@@ -1809,6 +1990,12 @@ class MainWindow(QMainWindow):
                     self.preview_win.view.highlight_balloon(hs.id)
             except Exception:
                 pass
+        # Update History / SPC dock
+        if getattr(self, 'history_dock', None) is not None and self.history_dock.isVisible():
+            try:
+                self.history_dock.update_for_hotspot(hs, self)
+            except Exception:
+                pass
 
     # ---- Preview sync & toggle ----
     def _toggle_preview_window(self, on: bool):
@@ -1890,6 +2077,73 @@ class MainWindow(QMainWindow):
                 # No selection: clear selection rect in preview
                 if hasattr(self.preview_win.view, "clear_selection_rect"):
                     self.preview_win.view.clear_selection_rect()
+        except Exception:
+            pass
+
+    # ---- History Dock wiring ----
+    def _setup_history_dock_action(self):
+        if getattr(self, 'act_history', None) is not None:
+            return
+        self.act_history = QAction("History / SPC", self)
+        self.act_history.setCheckable(True)
+        try:
+            self.act_history.setShortcut(QKeySequence("Ctrl+Shift+H"))
+        except Exception:
+            pass
+        self.act_history.toggled.connect(self._toggle_history_dock)
+        # Ensure a View menu exists
+        try:
+            if not hasattr(self, 'view_menu') or self.view_menu is None:
+                self.view_menu = self.menuBar().addMenu("&View")
+            self.view_menu.addAction(self.act_history)
+        except Exception:
+            pass
+
+    def _maybe_create_history_dock(self):
+        if getattr(self, 'history_dock', None) is not None:
+            return
+        try:
+            self.history_dock = HistoryDock(self)
+            self.history_dock.attach(self)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.history_dock)
+            self.history_dock.hide()
+            # Sync action when visibility changes
+            def _sync_action(vis: bool):
+                try:
+                    if getattr(self, 'act_history', None) is not None:
+                        if self.act_history.isChecked() != bool(vis):
+                            self.act_history.blockSignals(True)
+                            self.act_history.setChecked(bool(vis))
+                            self.act_history.blockSignals(False)
+                except Exception:
+                    pass
+            self.history_dock.visibilityChanged.connect(_sync_action)
+        except Exception:
+            self.history_dock = None
+
+    def _toggle_history_dock(self, on: bool):
+        self._maybe_create_history_dock()
+        if self.history_dock is None:
+            return
+        if on:
+            self.history_dock.show()
+            self._refresh_history_dock()
+        else:
+            self.history_dock.hide()
+
+    def _refresh_history_dock(self):
+        if self.history_dock is None or not self.history_dock.isVisible():
+            return
+        try:
+            indexes = self.table.selectionModel().selectedRows()
+            if indexes:
+                row = indexes[0].row()
+                if 0 <= row < len(self.hotspots):
+                    hs = self.hotspots[row]
+                    self.history_dock.update_for_hotspot(hs, self)
+            else:
+                self.history_dock.lbl_title.setText("Select a hotspot to view history")
+                self.history_dock.stats_label.setText("")
         except Exception:
             pass
 
