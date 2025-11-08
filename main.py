@@ -1512,8 +1512,20 @@ class MainWindow(QMainWindow):
                     pass
 
     def _collect_methods(self) -> list[str]:
+        # Merge persisted history with current table values
         methods: list[str] = []
         seen: set[str] = set()
+        # Load history from settings
+        try:
+            settings = getattr(self, 'settings', None) or QSettings("InspectionApp", "MainWindow")
+            hist = settings.value("Methods/history", [], list)
+            if isinstance(hist, list):
+                for v in hist:
+                    s = (str(v).strip())
+                    if s and s not in seen:
+                        methods.append(s); seen.add(s)
+        except Exception:
+            pass
         rows = self.table.rowCount()
         for r in range(rows):
             it = self.table.item(r, 2)
@@ -1522,6 +1534,24 @@ class MainWindow(QMainWindow):
                 methods.append(val)
                 seen.add(val)
         return methods
+
+    def _save_method_to_history(self, method: str):
+        method = (method or "").strip()
+        if not method:
+            return
+        try:
+            settings = getattr(self, 'settings', None) or QSettings("InspectionApp", "MainWindow")
+            hist = settings.value("Methods/history", [], list)
+            if not isinstance(hist, list):
+                hist = []
+            # Put most recent first; cap list length
+            new_hist = [method] + [v for v in hist if str(v).strip() and str(v).strip() != method]
+            MAX = 20
+            if len(new_hist) > MAX:
+                new_hist = new_hist[:MAX]
+            settings.setValue("Methods/history", new_hist)
+        except Exception:
+            pass
 
     def _update_method_filter_options(self):
         rows = self.table.rowCount()
@@ -1756,9 +1786,22 @@ class MainWindow(QMainWindow):
         col = item.column()
         text = (item.text() or "").strip()
         if col == 2:  # Inspection Method
+            # Preserve previous non-empty method if the edit produced an empty string inadvertently
+            prev = self.hotspots[row].method or ""
+            if text == "" and prev:
+                # Revert visual cell text and skip persistence/filter churn
+                self._updating_table = True
+                try:
+                    item.setText(prev)
+                finally:
+                    self._updating_table = False
+                return
             self.hotspots[row].method = text
             if self.mode == "ballooning":
                 self._save_hotspots_csv()
+            # Persist into history list
+            if text:
+                self._save_method_to_history(text)
             self._update_method_filter_options()
             self._apply_filters()
         elif col == 3:  # Result
@@ -2405,6 +2448,33 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Export PDF", f"Failed: {e}")
 
     def _row_selected(self, selected=None, deselected=None):
+        # Commit any active cell editor first so edits persist before changing selection
+        try:
+            from PyQt6.QtWidgets import QAbstractItemDelegate
+            ed = self.table.focusWidget()
+            if ed is not None:
+                # Only close editors that belong to this table to avoid framework warnings
+                try:
+                    p = ed
+                    belongs = False
+                    while p is not None:
+                        if p is self.table or p is self.table.viewport():
+                            belongs = True
+                            break
+                        p = p.parent()
+                    if belongs:
+                        try:
+                            self.table.closeEditor(ed, QAbstractItemDelegate.EndEditHint.SubmitModelCache)
+                        except Exception:
+                            try:
+                                ed.clearFocus()
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if not self.bp or not self.hotspots:
             return
         indexes = self.table.selectionModel().selectedRows()
